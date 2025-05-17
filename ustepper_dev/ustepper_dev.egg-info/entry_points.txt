@@ -1,0 +1,3 @@
+[console_scripts]
+ustepper_node = ustepper_dev.ustepper_node:main
+
