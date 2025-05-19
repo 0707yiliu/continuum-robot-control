@@ -63,6 +63,8 @@ class ReadWriteNode(Node):
         self._haptic_vel_joints = np.zeros(6)
         self.virtual_joints_torque = np.zeros(6)
 
+        self._haptic_joints_ref = np.zeros(6)
+
         self.dynamixel_current_reader = np.zeros(2) # for read current and update to motor list
         self._force_haptic_dev_joint = np.zeros(3)
 
@@ -103,6 +105,7 @@ class ReadWriteNode(Node):
         self.dynamixel_max_torque = np.array(config['dynamixel_io']['max_torque'])
         self.dynamixel_max_current = np.array(config['dynamixel_io']['max_current'])
         self.dynamixel_max_pwm = np.array(config['dynamixel_io']['max_pwm'])
+        self.dynamixel_K_t_current = self.dynamixel_max_torque / self.dynamixel_max_current
         self.dynamixel_K_t = self.dynamixel_max_torque / self.dynamixel_max_pwm # for calculate torque
         self.dynamixel_current_control_range = np.array(config['rob_central']['dynamixel_current_control_range'])
         self.damping_power = np.array(config['geomagic_touch_dev']['damping_power'])
@@ -155,10 +158,12 @@ class ReadWriteNode(Node):
 
     def _on_joint_state_event(self, msg):
         if not self._get_init_haptic_dev_joint:
-            self._haptic_dev_init_joint[:] = msg.position[:6]
+            self._haptic_dev_init_joint[:] = msg.position[:6] # rad
+            self._haptic_joints_ref[:] = msg.position[:6] # for impedence control /rad
         else:
             self._absolute_joints[:] = self._haptic_dev_init_joint - msg.position[:6]
             self._absolute_joints[0] = -self._absolute_joints[0] # for intuitive control
+            # publish in JointState config
             current_time_sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9 # convert ros time to sec
             positions = msg.position
             positions_np = np.array(positions)
@@ -176,19 +181,20 @@ class ReadWriteNode(Node):
             self.prev_positions = positions_np
             self.prev_time = current_time_sec
 
-            # self.virtual_joints_torque = -self.haptic_joint_spring * self._absolute_joints \
-            #                             -self.haptic_joint_damping * self._haptic_vel_joints
-            
-            self.virtual_joints_torque = -self.haptic_joint_spring * self._absolute_joints
-
-            # self.virtual_joints_torque = -self.haptic_joint_spring * self._absolute_joints \
-            #                             -self.haptic_joint_damping * np.sign(self._haptic_vel_joints) * abs(self._haptic_vel_joints) ** self.damping_power
+            self.virtual_joints_torque = -self.haptic_joint_spring * self._absolute_joints \
+                                        -self.haptic_joint_damping * np.sign(self._haptic_vel_joints) * abs(self._haptic_vel_joints) ** self.damping_power
             
             # self.get_logger().info(f'calculated virtual torque for Motor1 is {-self.virtual_joints_torque[0]} N.m')
             
             # test, calculate current
             # current_test = int(self.virtual_joints_torque[0] / self.dynamixel_K_t)
             # self.get_logger().info(f'calculated target current cmd for Motor1 is {current_test}')
+
+            if self.tele_mode == 3: # impedence control
+                self._haptic_joints_ref = self._impedence_alpha * self._haptic_joints_ref + (1 - self._impedence_alpha) * positions_np
+                self.virtual_joints_torque = -self.haptic_joint_spring * (positions_np - self._haptic_joints_ref) \
+                                        -self.haptic_joint_damping * np.sign(self._haptic_vel_joints) * abs(self._haptic_vel_joints) ** self.damping_power
+                
 
     def _on_state_event(self, msg):
         if not self._get_init_haptic_dev_posture:

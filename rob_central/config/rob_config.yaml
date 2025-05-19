@@ -2,14 +2,14 @@ dynamixel_io:
   port: '/dev/ttyACM1'
   max_torque: 6.0
   max_current: 1023
-  max_pwm: 8000
+  max_pwm: 8550
   # max_pwm: 855
 
 geomagic_touch_dev:
   init_position_tolerance: 0.01 # useless
   mass: 0.0005
   spring: 1
-  damping: 2 # use critical damping, computed in code
+  damping: 0 # use critical damping, computed in code
   damping_power: 1.5
 
 ustepper_dev:
@@ -20,7 +20,7 @@ ustepper_dev:
 rob_central:
   dynmaixel_motors_id: [1, 2]
   joint_threshold: [-0.1, 0.1] # blocked for dynamixel
-  position_threshold: [-30, 30] # blocked for ustepper
+  position_threshold: [-50, 50] # blocked for ustepper
   rotation_map_dynamixel_range: [-1.5, 1.5]
   bending_map_dynamixel_range: [-0.8, 0.8]
   bend_dynamixel_range: [1750, 2450]
