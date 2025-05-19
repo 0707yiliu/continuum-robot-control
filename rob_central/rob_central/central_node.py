@@ -17,18 +17,36 @@ import os
 import yaml
 from ament_index_python.packages import get_package_share_directory
 
+import torch
+import torch.nn as nn
+
 def load_rob_config():
     yaml_path = os.getenv("ROB_CENTRAL_CONFIG_PATH")
     if not yaml_path: # without the path in ENV
         yaml_path = os.path.join(get_package_share_directory('rob_central'), 'config', 'rob_config.yaml')
     with open(yaml_path, 'r') as f:
         return yaml.safe_load(f)
-
 config = load_rob_config()
 
 def map_range(x, in_min, in_max, out_min, out_max):
     return (x - in_min) / (in_max - in_min) * (out_max - out_min) + out_min
 
+def low_pass(last, now, ratio):
+    return ratio * last + (1 - ratio) * now
+
+class SimpleNet(nn.Module):
+    def __init__(self):
+        super(SimpleNet, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(2, 20),    
+            nn.ReLU(),
+            nn.Linear(20, 20),  
+            nn.ReLU(),
+            nn.Linear(20, 1)   
+        )
+
+    def forward(self, x):
+        return self.model(x)
 
 class ReadWriteNode(Node):
 
@@ -47,8 +65,10 @@ class ReadWriteNode(Node):
     def _initialize_state(self):
         self._get_init_haptic_dev_posture = False
         self._get_init_haptic_dev_joint = False
+        # self._init_button_triggered = False
 
         self._enable_rotate_dynamixel_motor = False
+        self._enable_translation_ustepper_motor = False
 
         self.prev_time = None
         self.prev_positions = None
@@ -63,18 +83,27 @@ class ReadWriteNode(Node):
         self._haptic_vel_joints = np.zeros(6)
         self.virtual_joints_torque = np.zeros(6)
 
+        self._haptic_joint_vel_last = np.zeros(6)
         self._haptic_joints_ref = np.zeros(6)
 
         self.dynamixel_current_reader = np.zeros(2) # for read current and update to motor list
         self._force_haptic_dev_joint = np.zeros(3)
+        self._bending_force = np.zeros(3)
 
         self.dynamixel_motor1_current = 0
+        self._last_dynamixel_motor1_current = 0
         self.dynamixel_motor1_position = 0
         self.dynamixel_motor1_vel = 0
 
         self.tele_mode = config['rob_central']['tele_mode'] 
         # for controlling the continuum robot with different modes, details in config.yaml
         self.bend_motor_residual_current_range = config['rob_central']['dynamixel_residual_current_range']
+
+        self.mapping_NN_absjoint_to_current_model = SimpleNet()
+        self._mapping_NN_absjoint_to_current_path = config['rob_central']['mapping_NN_absjoint_to_current_path']
+        self.mapping_NN_absjoint_to_current_model.load_state_dict(torch.load(self._mapping_NN_absjoint_to_current_path))
+        self.mapping_NN_absjoint_to_current_model.eval()
+        self._predict_current = 0
 
     def _configure_motors(self):
         self.dynamixel_ids = config['rob_central']['dynmaixel_motors_id'] # 2 dynamixel motors
@@ -106,9 +135,16 @@ class ReadWriteNode(Node):
         self.dynamixel_max_current = np.array(config['dynamixel_io']['max_current'])
         self.dynamixel_max_pwm = np.array(config['dynamixel_io']['max_pwm'])
         self.dynamixel_K_t_current = self.dynamixel_max_torque / self.dynamixel_max_current
-        self.dynamixel_K_t = self.dynamixel_max_torque / self.dynamixel_max_pwm # for calculate torque
+        self.dynamixel_K_t_PWM = self.dynamixel_max_torque / self.dynamixel_max_pwm # for calculate torque
         self.dynamixel_current_control_range = np.array(config['rob_central']['dynamixel_current_control_range'])
+        self.dynamixel_PWM_control_range = np.array(config['rob_central']['dynamixel_PWM_control_range'])
         self.damping_power = np.array(config['geomagic_touch_dev']['damping_power'])
+        self._impedance_pos_alpha = config['rob_central']['impedance_pos_alpha']
+        self._impedance_vel_alpha = config['rob_central']['impedance_vel_alpha']
+        self._current_alpha = config['rob_central']['current_alpha']
+        self._bending_force_alpha = config['rob_central']['bending_force_alpha']
+        self._bending_force_dead_zone = np.array(config['rob_central']['bending_force_dead_zone']) * 1000 # to N.mm
+        self._current_torque_ratio = config['rob_central']['current_torque_ratio']
 
         if self.tele_mode == 1 or self.tele_mode == 2:
             self.dynamixel_motors[0, 1] = np.mean(self.bend_dynamixel_range)
@@ -122,9 +158,8 @@ class ReadWriteNode(Node):
 
         self.publisher_debug = self.create_publisher(JointState, '/central_control/debug', 10)
 
-
     def _create_timers(self):
-        timer_period = 0.001
+        timer_period = 0.002
         self.start_time = time.time()
         self.create_timer(timer_period, self._publish_dynamixel_rotation_motor)
         self.create_timer(timer_period, self._publish_dynamixel_bending_motor)
@@ -151,10 +186,12 @@ class ReadWriteNode(Node):
         self.create_subscription(GetMotorState, '/dynamixel/id_1_motor_state', self._on_dynamixel_motor1_state, 10)
 
     def _on_button_event(self, msg):
-        if msg.grey_button == 1: # pushed
+        if msg.grey_button == 1 and not hasattr(self, '_init_button_triggered'): # pushed
             self._get_init_haptic_dev_joint = True
             self._get_init_haptic_dev_posture = True
+            self._init_button_triggered = True
         self._enable_rotate_dynamixel_motor = True if msg.white_button == 1 else False
+        self._enable_translation_ustepper_motor = True if msg.grey_button == 1 else False
 
     def _on_joint_state_event(self, msg):
         if not self._get_init_haptic_dev_joint:
@@ -180,9 +217,10 @@ class ReadWriteNode(Node):
             self._haptic_vel_joints = (positions_np - self.prev_positions) / dt
             self.prev_positions = positions_np
             self.prev_time = current_time_sec
-
-            self.virtual_joints_torque = -self.haptic_joint_spring * self._absolute_joints \
-                                        -self.haptic_joint_damping * np.sign(self._haptic_vel_joints) * abs(self._haptic_vel_joints) ** self.damping_power
+            self._haptic_joint_vel_last = low_pass(last=self._haptic_joint_vel_last, now=self._haptic_vel_joints, ratio=self._impedance_vel_alpha)
+            
+            # self.virtual_joints_torque = -self.haptic_joint_spring * self._absolute_joints \
+            #                             -self.haptic_joint_damping * np.sign(self._haptic_vel_joints) * abs(self._haptic_vel_joints) ** self.damping_power
             
             # self.get_logger().info(f'calculated virtual torque for Motor1 is {-self.virtual_joints_torque[0]} N.m')
             
@@ -191,10 +229,11 @@ class ReadWriteNode(Node):
             # self.get_logger().info(f'calculated target current cmd for Motor1 is {current_test}')
 
             if self.tele_mode == 3: # impedence control
-                self._haptic_joints_ref = self._impedence_alpha * self._haptic_joints_ref + (1 - self._impedence_alpha) * positions_np
+                # calculate the virtual force for controlling bending dynamixel motor, output unit: N.m
+                self._haptic_joints_ref = low_pass(last=self._haptic_joints_ref, now=positions_np, ratio=self._impedance_pos_alpha)
+                self._haptic_joint_vel_last = low_pass(last=self._haptic_joint_vel_last, now=self._haptic_vel_joints, ratio=self._impedance_vel_alpha)
                 self.virtual_joints_torque = -self.haptic_joint_spring * (positions_np - self._haptic_joints_ref) \
-                                        -self.haptic_joint_damping * np.sign(self._haptic_vel_joints) * abs(self._haptic_vel_joints) ** self.damping_power
-                
+                                        -self.haptic_joint_damping * np.sign(self._haptic_joint_vel_last) * abs(self._haptic_joint_vel_last) ** self.damping_power
 
     def _on_state_event(self, msg):
         if not self._get_init_haptic_dev_posture:
@@ -206,8 +245,8 @@ class ReadWriteNode(Node):
             self._update_motor_targets()
 
     def _on_dynamixel_motor1_state(self, msg):
-        self.dynamixel_motor1_current = msg.current * 2.69 * 1.1 # to mNm
-        # self.dynamixel_motor1_current = msg.current
+        # self.dynamixel_motor1_current = msg.current * 2.69 # to mA for low-level motors
+        self.dynamixel_motor1_current = msg.current # unit: mA
         # self.dynamixel_motor1_position = msg.position * (360 / 4096) # to degree
         self.dynamixel_motor1_position = msg.position # rad
         self.dynamixel_motor1_vel = msg.velocity * 0.229 # to rpm
@@ -230,8 +269,9 @@ class ReadWriteNode(Node):
                 self.bend_dynamixel_range
             )
         elif self.tele_mode == 3:
-            self.dynamixel_motors[0, 1] = int(-self.virtual_joints_torque[0] / self.dynamixel_K_t)
-            self.dynamixel_motors[0, 1] = np.clip(self.dynamixel_motors[0, 1], *self.dynamixel_current_control_range)
+            self.dynamixel_motors[0, 1] = int(-self.virtual_joints_torque[0] / self.dynamixel_K_t_PWM) # # unit: N.m / N.m/% - %
+            # self.dynamixel_motors[0, 1] = np.clip(self.dynamixel_motors[0, 1], *self.dynamixel_current_control_range)
+            self.dynamixel_motors[0, 1] = np.clip(self.dynamixel_motors[0, 1], *self.dynamixel_PWM_control_range)
 
         # uStepper Motor
         self.ustepper_motors = self._map_motor_value(
@@ -290,19 +330,32 @@ class ReadWriteNode(Node):
         self.publisher_feedbcak_force_to_haptic_dev.publish(msg)
 
     def _publish_ustepper_motor(self):
-        msg = Float64()
-        msg.data = float(self.ustepper_motors)
-        self.publisher_control_ustepper_motors.publish(msg)
+        if self._enable_translation_ustepper_motor is True:
+            msg = Float64()
+            msg.data = float(self.ustepper_motors)
+            self.publisher_control_ustepper_motors.publish(msg)
+        else:
+            pass
 
     def _publish_debug(self):
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = ['virtual_joint1_torque', 'motor1_current', 'force_feedback_to_haptic_dev']
+        # msg.name = ['virtual_joint1_torque', 'virtual_joint1_torque_to_PWM', 'motor1_current_to_torque', 'force_feedback_to_haptic_dev']
+        msg.name = ['virtual_joint1_torque', 'motor1_current_to_torque', 
+        'diff_torque', 'force_feedback_to_haptic_dev', 
+        'abs_joint0', 'predict_current',
+        'joint1_vel',]
         t = time.time() - self.start_time
         msg.position = [
-            float(self.virtual_joints_torque[0] / self.dynamixel_K_t), 
-            float(-self.dynamixel_motor1_current), 
-            float(self._force_haptic_dev_joint[0])
+            float(self.virtual_joints_torque[0]), # unit: N.m
+            # float(self.virtual_joints_torque[0] / self.dynamixel_K_t_PWM), # unit: N.m / N.m/% - %
+            float(-self._last_dynamixel_motor1_current * self.dynamixel_K_t_current),  # unit: N.m
+            float(-self._last_dynamixel_motor1_current * self.dynamixel_K_t_current - self.virtual_joints_torque[0]),
+            # float(self._bending_force[0] / 1000), # unit: N.m
+            float(-self._force_haptic_dev_joint[0] / 1000), # unit: N.m
+            float(self._absolute_joints[0]),
+            float(self._predict_current),
+            float(self._haptic_joint_vel_last[0]),
             ]
         msg.velocity = []
         msg.effort = []
@@ -329,30 +382,45 @@ class ReadWriteNode(Node):
 
     def _control_haptic_force_from_dynamixel_current(self):
         id = 1 # hard code, revised in future
-        # !client current
-        # self._call_dynamixel_current_service(motor_id=id)
-        # id_current = self.dynamixel_motors_current[self.dynamixel_motors_current[:, 0] == id, 1]
-
-        # self.get_logger().info(f"ID: {id}, Current: {id_current}")
-
         # ! joint force/torque control
-        if id == 1: # rotate motor -> haptic dev's root joint
-            # !sub current
-            # root_joint_torque = map_range(self.dynamixel_motor1_current, self.dynamixel_current_range[0], self.dynamixel_current_range[1], self.haptic_dev_joint_force_range[0], self.haptic_dev_joint_force_range[1])
-            root_joint_torque = self.dynamixel_K_t * self.dynamixel_motor1_current
-            # !client current
-            # root_joint_torque = map_range(id_current, self.dynamixel_current_range[0], self.dynamixel_current_range[1], self.haptic_dev_joint_force_range[0], self.haptic_dev_joint_force_range[1])
-            self._force_haptic_dev_joint[0] = root_joint_torque * 1000 # to N/m
-            self._publish_force_pos_to_haptic_dev(self._force_haptic_dev_joint)
-    
+
+        # # calculate current-torque and feedback directly
+        # if id == 1: # rotate motor -> haptic dev's root joint
+        #     # !sub current
+        #     # root_joint_torque = map_range(self.dynamixel_motor1_current, self.dynamixel_current_range[0], self.dynamixel_current_range[1], self.haptic_dev_joint_force_range[0], self.haptic_dev_joint_force_range[1])
+        #     self._last_dynamixel_motor1_current = low_pass(last=self._last_dynamixel_motor1_current, now=self.dynamixel_motor1_current, ratio=self._current_alpha)
+        #     root_joint_torque = self.dynamixel_K_t_current * self._last_dynamixel_motor1_current
+        #     # root_joint_torque = 0 if -0.18 < self.root_joint_torque < 0.18 else root_joint_torque
+        #     # !client current
+        #     # root_joint_torque = map_range(id_current, self.dynamixel_current_range[0], self.dynamixel_current_range[1], self.haptic_dev_joint_force_range[0], self.haptic_dev_joint_force_range[1])
+        #     self._force_haptic_dev_joint[0] = root_joint_torque * 1000 * self._current_torque_ratio # to N/m
+        #     self._publish_force_pos_to_haptic_dev(self._force_haptic_dev_joint)
+
+        # # calculate current-torque and residual torque with mapped current-torque-position
+        # !!! in this way, 
+        # !!! first, collect some data (absolute joint position, current-torque) offline, 
+        # !!! second, get online absolute position to calculate mapped current-torque (nerual network / table-mapping ...)
+        # !!! final, calculate residual current-torque by: mapped current-torque - online current-torque
+        # obtain online current feedback / collecting data
+        self._last_dynamixel_motor1_current = low_pass(last=self._last_dynamixel_motor1_current, now=self.dynamixel_motor1_current, ratio=self._current_alpha)
+        # load mapped model and evaluate the model
+        input_array = np.array([[self._absolute_joints[0], self._haptic_joint_vel_last[0]]], dtype=np.float32)
+        self._predict_current = self.mapping_NN_absjoint_to_current_model(torch.from_numpy(input_array)).detach().numpy()
+        # calculate residual current-torque and add to haptic device
+        root_joint_torque = self.dynamixel_K_t_current * (self._last_dynamixel_motor1_current - self._predict_current)
+        self._force_haptic_dev_joint[0] = root_joint_torque * 1000 * self._current_torque_ratio # to N/m
+        self._publish_force_pos_to_haptic_dev(self._force_haptic_dev_joint)
+
     def _control_haptic_force_from_residual_current(self):
         id = 1 # hard code, revised in future
-        ratio = 1.25
         # self.get_logger().info(f'current feedback is {self.dynamixel_motor1_current}')
         if id == 1: # rotate motor -> haptic dev's root joint
-            feedback_joint_torque = self.dynamixel_K_t * (-self.dynamixel_motor1_current * ratio - (self.virtual_joints_torque[0] / self.dynamixel_K_t))
-            self._force_haptic_dev_joint[0] = -self.virtual_joints_torque[0] * 1000  # to N/m
-            self._publish_force_pos_to_haptic_dev(self._force_haptic_dev_joint)
+            self._last_dynamixel_motor1_current = low_pass(last=self._last_dynamixel_motor1_current, now=self.dynamixel_motor1_current, ratio=self._current_alpha)
+            feedback_current_to_torque = -self._last_dynamixel_motor1_current * self.dynamixel_K_t_current # unit: N.m
+            self._force_haptic_dev_joint[0] = feedback_current_to_torque - self.virtual_joints_torque[0] * 1000 # to N.mm
+            self._bending_force = low_pass(last=self._bending_force, now=self._force_haptic_dev_joint, ratio=self._bending_force_alpha)
+            self._bending_force[0] = 0 if self._bending_force_dead_zone[0] < self._bending_force[0] < self._bending_force_dead_zone[1] else self._bending_force[0]
+            self._publish_force_pos_to_haptic_dev(self._bending_force)
         
 def main(args=None):
     rclpy.init(args=args)

@@ -32,7 +32,8 @@
 #define PROTOCOL_VERSION 2.0  // Default Protocol version of DYNAMIXEL X series.
 
 // Default setting
-#define BAUDRATE 57600  // Default Baudrate of DYNAMIXEL X series
+#define BAUDRATE 1000000
+                   // Default Baudrate of DYNAMIXEL X series
 // #define DEVICE_NAME "/dev/ttyACM1"  // [Linux]: "/dev/ttyUSB*", [Windows]: "COM*"
 
 dynamixel::PortHandler * portHandler;
@@ -201,7 +202,7 @@ ReadWriteNode::ReadWriteNode(int control_mode)
     "/dynamixel/id_1_motor_state", QOS_RKL10V);
   
   timer_ = this->create_wall_timer(
-    std::chrono::milliseconds(100),
+    std::chrono::milliseconds(2),
     std::bind(&ReadWriteNode::pub_motor1_callback, this));
 
   auto get_present_position =

@@ -1,7 +1,14 @@
 from launch import LaunchDescription
 from launch_ros.actions import Node
+from launch.actions import ExecuteProcess
+from datetime import datetime
+import os
 
 def generate_launch_description():
+
+    time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_dir = os.path.expanduser(f'~/rosbags/continuum_demonstration/rosbag_all_topic_{time_str}')
+
     return LaunchDescription([
         Node(
             package='dynamixel_io',
@@ -36,4 +43,13 @@ def generate_launch_description():
             # emulate_tty=True,
             # parameters=['config/params.yaml'],
         ),
+
+        ExecuteProcess(
+            cmd=[
+                'ros2', 'bag', 'record',
+                '-a',
+                '-o', save_dir
+            ],
+            output='screen'
+        )
     ])
